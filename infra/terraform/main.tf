@@ -38,13 +38,13 @@ module "eks" {
   source          = "terraform-aws-modules/eks/aws"
   version         = "~> 19.0"
 
-  cluster_name    = var.cluster_name
-  cluster_version = var.k8s_version
+  name    = var.cluster_name
+  kubernetes_version = var.k8s_version
   subnet_ids        = module.vpc.private_subnets
 
   vpc_id = module.vpc.vpc_id
 
-  node_groups = {
+ eks_managed_node_groups = {
     robotshop_nodes = {
       desired_capacity = 2
       max_capacity     = 3
@@ -53,8 +53,6 @@ module "eks" {
       instance_type = "t3.medium"
     }
   }
-
-  map_users = []
 }
 
 provider "kubernetes" {
