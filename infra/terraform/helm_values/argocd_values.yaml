@@ -1,0 +1,13 @@
+server:
+  service:
+    type: ClusterIP
+
+configs:
+  cm:
+    application.instanceLabelKey: argocd.argoproj.io/instance
+
+redis:
+  enabled: true
+
+controller:
+  enabled: false
