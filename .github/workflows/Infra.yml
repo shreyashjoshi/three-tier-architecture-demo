@@ -1,0 +1,134 @@
+# Quick run examples (use the Actions tab -> Run workflow):
+# - Create cluster:
+#   action: create
+#   cluster_name: demo-cluster
+#   region: us-west-2
+#   node_count: 2
+#   node_type: t3.medium
+#   wait: true
+#
+# - Delete cluster:
+#   action: delete
+#   cluster_name: demo-cluster
+#   region: us-west-2
+
+name: EKS Infra
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Operation to perform: create or delete'
+        required: true
+        default: 'create'
+        type: choice
+        options:
+          - create
+          - delete
+      cluster_name:
+        description: 'EKS cluster name'
+        required: true
+        default: 'demo-cluster'
+      region:
+        description: 'AWS region'
+        required: true
+        default: 'us-west-2'
+      node_count:
+        description: 'Number of nodes (used for create)'
+        required: false
+        default: '2'
+      node_type:
+        description: 'EC2 instance type for nodes'
+        required: false
+        default: 't3.medium'
+      k8s_version:
+        description: 'Kubernetes version (e.g. 1.27)'
+        required: false
+        default: ''
+      wait:
+        description: 'Whether to wait for cluster creation to complete (true/false)'
+        required: false
+        default: 'true'
+      role_arn:
+        description: 'Optional IAM role ARN to associate with nodegroup (leave empty to let eksctl create)'
+        required: false
+        default: ''
+
+jobs:
+  eks:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ github.event.inputs.region }}
+
+      - name: Install eksctl
+        run: |
+          curl --silent --location "https://github.com/weaveworks/eksctl/releases/latest/download/eksctl_$(uname -s)_amd64.tar.gz" | tar xz -C /tmp
+          sudo mv /tmp/eksctl /usr/local/bin
+
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+
+      - name: Select action
+        id: action
+        run: |
+          echo "action=${{ github.event.inputs.action }}" >> $GITHUB_OUTPUT
+
+      - name: Create EKS cluster
+        if: steps.action.outputs.action == 'create'
+        run: |
+          set -e
+          CLUSTER_NAME='${{ github.event.inputs.cluster_name }}'
+          REGION='${{ github.event.inputs.region }}'
+          NODE_COUNT='${{ github.event.inputs.node_count }}'
+          NODE_TYPE='${{ github.event.inputs.node_type }}'
+          K8S_VERSION='${{ github.event.inputs.k8s_version }}'
+          WAIT='${{ github.event.inputs.wait }}'
+          ROLE_ARN='${{ github.event.inputs.role_arn }}'
+
+          # Build eksctl create cluster command
+          CMD=(eksctl create cluster --name "$CLUSTER_NAME" --region "$REGION" --nodes "$NODE_COUNT" --node-type "$NODE_TYPE")
+          if [ -n "$K8S_VERSION" ]; then
+            CMD+=(--version "$K8S_VERSION")
+          fi
+          if [ "$WAIT" = 'false' ]; then
+            CMD+=(--wait=false)
+          fi
+          if [ -n "$ROLE_ARN" ]; then
+            CMD+=(--node-iam-role-arn "$ROLE_ARN")
+          fi
+
+          echo "Running: ${CMD[*]}"
+          "${CMD[@]}"
+
+      - name: Delete EKS cluster
+        if: steps.action.outputs.action == 'delete'
+        run: |
+          set -e
+          CLUSTER_NAME='${{ github.event.inputs.cluster_name }}'
+          REGION='${{ github.event.inputs.region }}'
+          echo "Deleting cluster $CLUSTER_NAME in $REGION"
+          eksctl delete cluster --name "$CLUSTER_NAME" --region "$REGION" --wait
+
+      - name: Output kubeconfig
+        if: steps.action.outputs.action == 'create' && github.event.inputs.wait == 'true'
+        run: |
+          CLUSTER_NAME='${{ github.event.inputs.cluster_name }}'
+          REGION='${{ github.event.inputs.region }}'
+          aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$REGION"
+          kubectl get nodes --no-headers || true
+
+# Notes:
+# - Provide AWS credentials via repository secrets: AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY.
+# - Trigger using the Actions "Run workflow" button and set the inputs.
+# - The workflow installs eksctl and kubectl at runtime. For private runner usage, pre-install them.
