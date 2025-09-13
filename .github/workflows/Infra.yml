@@ -49,6 +49,19 @@ on:
         description: 'Whether to wait for cluster creation to complete (true/false)'
         required: false
         default: 'true'
+      deploy_ingress:
+        description: 'Whether to deploy an ingress controller after create (true/false)'
+        required: false
+        default: 'false'
+      ingress_controller:
+        description: 'Which ingress controller to install'
+        required: false
+        default: 'nginx'
+        type: choice
+        options:
+          - nginx
+          - traefik
+          - aws-alb
       role_arn:
         description: 'Optional IAM role ARN to associate with nodegroup (leave empty to let eksctl create)'
         required: false
@@ -127,6 +140,84 @@ jobs:
           REGION='${{ github.event.inputs.region }}'
           aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$REGION"
           kubectl get nodes --no-headers || true
+
+      - name: Install Helm
+        if: steps.action.outputs.action == 'create' && github.event.inputs.deploy_ingress == 'true'
+        run: |
+          curl -sSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+      - name: Deploy Ingress controller (nginx)
+        if: steps.action.outputs.action == 'create' && github.event.inputs.deploy_ingress == 'true' && github.event.inputs.ingress_controller == 'nginx'
+        run: |
+          # add repo and install ingress-nginx via Helm
+          helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+          helm repo update
+          kubectl create namespace ingress-nginx || true
+          helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
+            --namespace ingress-nginx \
+            --set controller.publishService.enabled=true
+
+      - name: Deploy Ingress controller (traefik)
+        if: steps.action.outputs.action == 'create' && github.event.inputs.deploy_ingress == 'true' && github.event.inputs.ingress_controller == 'traefik'
+        run: |
+          # add repo and install traefik via Helm
+          helm repo add traefik https://traefik.github.io/charts
+          helm repo update
+          kubectl create namespace traefik || true
+          helm upgrade --install traefik traefik/traefik --namespace traefik
+
+      - name: Deploy AWS Load Balancer Controller (ALB)
+        if: steps.action.outputs.action == 'create' && github.event.inputs.deploy_ingress == 'true' && github.event.inputs.ingress_controller == 'aws-alb'
+        env:
+          CLUSTER_NAME: ${{ github.event.inputs.cluster_name }}
+          REGION: ${{ github.event.inputs.region }}
+        run: |
+          set -euo pipefail
+          # Ensure OIDC provider is associated with the cluster (idempotent)
+          eksctl utils associate-iam-oidc-provider --cluster "$CLUSTER_NAME" --region "$REGION" --approve || true
+
+          # Prepare IAM policy for AWS Load Balancer Controller
+          POLICY_NAME="AWSLoadBalancerControllerIAMPolicy-${CLUSTER_NAME}"
+          POLICY_URL="https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/main/docs/install/iam_policy.json"
+
+          # Check if policy already exists
+          EXISTING_POLICY_ARN=$(aws iam list-policies --scope Local --query "Policies[?PolicyName=='$POLICY_NAME'].Arn | [0]" --output text || echo "None")
+          if [ "$EXISTING_POLICY_ARN" = "None" ] || [ -z "$EXISTING_POLICY_ARN" ]; then
+            # create policy from upstream document
+            TMP_POLICY=$(mktemp)
+            curl -sS "$POLICY_URL" -o "$TMP_POLICY"
+            POLICY_ARN=$(aws iam create-policy --policy-name "$POLICY_NAME" --policy-document file://"$TMP_POLICY" --query 'Policy.Arn' --output text)
+            rm -f "$TMP_POLICY"
+          else
+            POLICY_ARN="$EXISTING_POLICY_ARN"
+          fi
+
+          echo "Using policy ARN: $POLICY_ARN"
+
+          # Create iamserviceaccount for the controller using eksctl (idempotent when --approve used)
+          eksctl create iamserviceaccount \
+            --cluster "$CLUSTER_NAME" \
+            --region "$REGION" \
+            --namespace kube-system \
+            --name aws-load-balancer-controller \
+            --attach-policy-arn "$POLICY_ARN" \
+            --override-existing-serviceaccounts \
+            --approve
+
+          # Get VPC ID for Helm values
+          VPC_ID=$(aws eks describe-cluster --name "$CLUSTER_NAME" --region "$REGION" --query 'cluster.resourcesVpcConfig.vpcId' --output text)
+
+          # Install helm chart
+          helm repo add eks https://aws.github.io/eks-charts
+          helm repo update
+          kubectl create namespace kube-system || true
+          helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-controller \
+            --namespace kube-system \
+            --set clusterName="$CLUSTER_NAME" \
+            --set serviceAccount.create=false \
+            --set serviceAccount.name=aws-load-balancer-controller \
+            --set region="$REGION" \
+            --set vpcId="$VPC_ID"
 
 # Notes:
 # - Provide AWS credentials via repository secrets: AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY.
